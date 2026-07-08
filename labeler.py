@@ -10,18 +10,23 @@ from tkinter import BOTH, LEFT, RIGHT, Y, Button, Canvas, Frame, Label, Listbox,
 try:
     from PIL import Image, ImageTk
 except ImportError as exc:
-    raise SystemExit(
-        "Pillow is required to run the GUI labeler. Install it with: uv add pillow"
-    ) from exc
+    raise SystemExit("Pillow is required. Install it with: uv add pillow") from exc
 
 
-# You can hard-code your raw image folder here, or pass --input-root.
-# Images can be mixed together regardless of direction.
-INPUT_ROOT = "samples/test_image"
+INPUT_ROOT = "samples"
 OUTPUT_ROOT = "labeled_data"
 
 DIRECTIONS = ("Front", "Back", "Left", "Right")
+LABEL_SETS = ("Main", "Opposite")
+SIDE_DIRECTIONS = {"Left", "Right"}
+OPPOSITE_DIRECTIONS = {"Left": "Right", "Right": "Left"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+DISPLAY_SCALE_LIMIT = 0.8
+MAIN_COLOR = "#2563eb"
+OPPOSITE_COLOR = "#f97316"
+ZOOM_MIN = 0.25
+ZOOM_MAX = 4.0
+ZOOM_STEP = 1.25
 
 KEYPOINT_LABELS = [
     "Ear",
@@ -37,6 +42,7 @@ KEYPOINT_LABELS = [
     "Lateral malleolus of the distal tibia",
     "Distal lateral aspect of the fifth metatarsus",
 ]
+KEYPOINT_NUMBERS = {label: index + 1 for index, label in enumerate(KEYPOINT_LABELS)}
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +64,8 @@ def make_empty_label(image_path: Path, width: int, height: int) -> dict:
             "resolution": f"{width}X{height}",
         },
         "annotation_info": [],
+        "opposite_annotation_info": [],
+        "opposite_direction": "",
         "pet_medical_record_info": [],
         "sensor_values": [],
         "timestamp": int(time.time()),
@@ -75,22 +83,28 @@ class DogPoseLabeler:
         self.output_root = output_root
 
         self.direction = StringVar(value=DIRECTIONS[0])
+        self.label_set = StringVar(value=LABEL_SETS[0])
+        self.active_label_set = self.label_set.get()
         self.selected_label = StringVar(value=KEYPOINT_LABELS[0])
         self.images: list[Path] = []
         self.current_image: Path | None = None
         self.current_json: dict | None = None
         self.annotations: list[dict[str, str]] = []
+        self.main_annotations: list[dict[str, str]] = []
+        self.opposite_annotations: list[dict[str, str]] = []
 
         self.original_image: Image.Image | None = None
         self.display_image: Image.Image | None = None
         self.tk_image: ImageTk.PhotoImage | None = None
         self.image_offset = (0, 0)
         self.image_scale = 1.0
+        self.zoom_factor = 1.0
         self.selected_point_index = -1
         self.dragging_point_index = -1
+        self.show_pose_names = False
 
         self.root.title("Dog Pose Labeler")
-        self.root.geometry("1320x820")
+        self.root.geometry("1180x760")
         self.root.minsize(980, 640)
 
         self.build_layout()
@@ -103,7 +117,12 @@ class DogPoseLabeler:
         Label(left_panel, text="Direction", anchor="w").pack(fill="x")
         direction_combo = ttk.Combobox(left_panel, textvariable=self.direction, values=DIRECTIONS, state="readonly")
         direction_combo.pack(fill="x", pady=(0, 8))
-        direction_combo.bind("<<ComboboxSelected>>", lambda _: self.reload_label_for_direction())
+        direction_combo.bind("<<ComboboxSelected>>", lambda _: self.reload_current_label())
+
+        Label(left_panel, text="Label Set", anchor="w").pack(fill="x")
+        label_set_combo = ttk.Combobox(left_panel, textvariable=self.label_set, values=LABEL_SETS, state="readonly")
+        label_set_combo.pack(fill="x", pady=(0, 8))
+        label_set_combo.bind("<<ComboboxSelected>>", lambda _: self.switch_label_set())
 
         Button(left_panel, text="Refresh", command=self.load_images).pack(fill="x", pady=(0, 8))
 
@@ -118,7 +137,6 @@ class DogPoseLabeler:
         self.image_list.bind("<<ListboxSelect>>", self.on_image_select)
 
         center = Frame(self.root)
-        center.pack(side=LEFT, fill=BOTH, expand=True)
 
         toolbar = Frame(center, padx=8, pady=8)
         toolbar.pack(fill="x")
@@ -127,6 +145,8 @@ class DogPoseLabeler:
         Button(toolbar, text="Save", command=self.save_label).pack(side=LEFT, padx=(6, 0))
         Button(toolbar, text="Undo", command=self.undo_point).pack(side=LEFT, padx=(6, 0))
         Button(toolbar, text="Clear", command=self.clear_points).pack(side=LEFT, padx=(6, 0))
+        self.pose_name_button = Button(toolbar, text="Names: OFF", command=self.toggle_pose_names)
+        self.pose_name_button.pack(side=LEFT, padx=(6, 0))
         self.status = Label(toolbar, text="", anchor="w")
         self.status.pack(side=LEFT, fill="x", expand=True, padx=(12, 0))
 
@@ -137,15 +157,20 @@ class DogPoseLabeler:
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
+        zoom_controls = Frame(self.canvas, background="#111827")
+        Button(zoom_controls, text="-", width=3, command=self.zoom_out).pack(side=LEFT)
+        Button(zoom_controls, text="+", width=3, command=self.zoom_in).pack(side=LEFT)
+        zoom_controls.place(relx=1.0, x=-12, y=12, anchor="ne")
 
-        right_panel = Frame(self.root, width=340, padx=8, pady=8)
+        right_panel = Frame(self.root, width=360, padx=8, pady=8)
         right_panel.pack(side=RIGHT, fill=Y)
+        right_panel.pack_propagate(False)
 
         Label(right_panel, text="Keypoints", anchor="w").pack(fill="x")
         self.keypoint_list = Listbox(right_panel, exportselection=False, height=14)
         self.keypoint_list.pack(fill="x", pady=(0, 8))
         for label in KEYPOINT_LABELS:
-            self.keypoint_list.insert("end", label)
+            self.keypoint_list.insert("end", f"{KEYPOINT_NUMBERS[label]}. {label}")
         self.keypoint_list.selection_set(0)
         self.keypoint_list.bind("<<ListboxSelect>>", self.on_keypoint_select)
 
@@ -158,6 +183,8 @@ class DogPoseLabeler:
         point_scroll.pack(side=RIGHT, fill=Y)
         self.point_list.config(yscrollcommand=point_scroll.set)
         self.point_list.bind("<<ListboxSelect>>", self.on_point_select)
+
+        center.pack(side=LEFT, fill=BOTH, expand=True)
 
         self.root.bind("<Delete>", lambda _: self.delete_selected_point())
         self.root.bind("<BackSpace>", lambda _: self.delete_selected_point())
@@ -181,6 +208,8 @@ class DogPoseLabeler:
             self.current_image = None
             self.current_json = None
             self.annotations = []
+            self.main_annotations = []
+            self.opposite_annotations = []
             self.original_image = None
             self.update_point_list()
             self.render_image()
@@ -188,9 +217,8 @@ class DogPoseLabeler:
 
     def on_image_select(self, _: object) -> None:
         selection = self.image_list.curselection()
-        if not selection:
-            return
-        self.load_image(self.images[selection[0]])
+        if selection:
+            self.load_image(self.images[selection[0]])
 
     def load_image(self, image_path: Path) -> None:
         self.current_image = image_path
@@ -198,16 +226,34 @@ class DogPoseLabeler:
         self.selected_point_index = -1
         self.dragging_point_index = -1
 
+        if not self.is_valid_label_set():
+            self.current_json = make_empty_label(image_path, self.original_image.width, self.original_image.height)
+            self.annotations = []
+            self.main_annotations = []
+            self.opposite_annotations = []
+            self.active_label_set = self.label_set.get()
+            self.update_point_list()
+            self.render_image()
+            self.set_status("Opposite labeling is only available for Left/Right side images.")
+            return
+
         label_path = self.label_path_for(image_path)
         if label_path.exists():
             self.current_json = json.loads(label_path.read_text(encoding="utf-8"))
         else:
             self.current_json = make_empty_label(image_path, self.original_image.width, self.original_image.height)
 
-        self.annotations = list(self.current_json.get("annotation_info", []))
+        self.main_annotations = list(self.current_json.get("annotation_info", []))
+        self.opposite_annotations = list(self.current_json.get("opposite_annotation_info", []))
+        self.active_label_set = self.label_set.get()
+        self.annotations = self.active_annotations()
         self.update_point_list()
         self.render_image()
-        self.set_status(f"{self.direction.get()} / {image_path.relative_to(self.input_root)}")
+        self.set_status(
+            f"Direction: {self.direction.get()} / Set: {self.label_set.get()} / "
+            f"main {len(self.main_annotations)} / opposite {len(self.opposite_annotations)} / "
+            f"{image_path.relative_to(self.input_root)}"
+        )
 
     def label_path_for(self, image_path: Path) -> Path:
         return self.output_root / "label" / self.direction.get() / f"{image_path.stem}.json"
@@ -215,10 +261,52 @@ class DogPoseLabeler:
     def output_image_path_for(self, image_path: Path) -> Path:
         return self.output_root / "image" / self.direction.get() / image_path.name
 
-    def reload_label_for_direction(self) -> None:
+    def annotation_key(self) -> str:
+        return "opposite_annotation_info" if self.label_set.get() == "Opposite" else "annotation_info"
+
+    def active_annotations(self) -> list[dict[str, str]]:
+        return self.opposite_annotations if self.label_set.get() == "Opposite" else self.main_annotations
+
+    def sync_active_annotations(self) -> None:
+        if self.active_label_set == "Opposite":
+            self.opposite_annotations = self.annotations
+        else:
+            self.main_annotations = self.annotations
+
+    def opposite_direction(self) -> str:
+        return OPPOSITE_DIRECTIONS.get(self.direction.get(), "")
+
+    def is_valid_label_set(self) -> bool:
+        return self.label_set.get() != "Opposite" or self.direction.get() in SIDE_DIRECTIONS
+
+    def reload_current_label(self) -> None:
+        self.sync_active_annotations()
+        if self.current_image is not None:
+            self.load_image(self.current_image)
+
+    def switch_label_set(self) -> None:
         if self.current_image is None:
             return
-        self.load_image(self.current_image)
+        self.sync_active_annotations()
+        if not self.is_valid_label_set():
+            self.annotations = []
+            self.active_label_set = self.label_set.get()
+            self.selected_point_index = -1
+            self.dragging_point_index = -1
+            self.update_point_list()
+            self.render_image()
+            self.set_status("Opposite labeling is only available for Left/Right side images.")
+            return
+        self.annotations = self.active_annotations()
+        self.active_label_set = self.label_set.get()
+        self.selected_point_index = -1
+        self.dragging_point_index = -1
+        self.update_point_list()
+        self.render_image()
+        self.set_status(
+            f"Direction: {self.direction.get()} / Set: {self.label_set.get()} / "
+            f"main {len(self.main_annotations)} / opposite {len(self.opposite_annotations)}"
+        )
 
     def on_keypoint_select(self, _: object) -> None:
         selection = self.keypoint_list.curselection()
@@ -258,11 +346,12 @@ class DogPoseLabeler:
 
         canvas_width = max(1, self.canvas.winfo_width())
         canvas_height = max(1, self.canvas.winfo_height())
-        scale = min(
-            canvas_width / self.original_image.width,
-            canvas_height / self.original_image.height,
+        base_scale = min(
+            (canvas_width * DISPLAY_SCALE_LIMIT) / self.original_image.width,
+            (canvas_height * DISPLAY_SCALE_LIMIT) / self.original_image.height,
             1.0,
         )
+        scale = base_scale * self.zoom_factor
         display_width = max(1, int(self.original_image.width * scale))
         display_height = max(1, int(self.original_image.height * scale))
         self.image_scale = scale
@@ -275,13 +364,57 @@ class DogPoseLabeler:
 
     def draw_points(self) -> None:
         offset_x, offset_y = self.image_offset
-        for index, item in enumerate(self.annotations):
-            x = offset_x + float(item["x"]) * self.original_image.width * self.image_scale
-            y = offset_y + float(item["y"]) * self.original_image.height * self.image_scale
-            radius = 7 if index == self.selected_point_index else 5
-            color = "#f97316" if index == self.selected_point_index else "#0f766e"
-            self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=color, outline="#ffffff", width=2)
-            self.canvas.create_text(x + 10, y - 10, text=str(index + 1), fill="#111827", anchor="w", font=("Arial", 11, "bold"))
+        if self.label_set.get() == "Opposite":
+            self.draw_annotation_set(self.main_annotations, offset_x, offset_y, MAIN_COLOR, active=False)
+            self.draw_annotation_set(self.opposite_annotations, offset_x, offset_y, OPPOSITE_COLOR, active=True)
+        else:
+            self.draw_annotation_set(self.opposite_annotations, offset_x, offset_y, OPPOSITE_COLOR, active=False)
+            self.draw_annotation_set(self.main_annotations, offset_x, offset_y, MAIN_COLOR, active=True)
+
+    def draw_annotation_set(self, annotations: list[dict[str, str]], offset_x: int, offset_y: int, color: str, active: bool) -> None:
+        for index, item in enumerate(annotations):
+            try:
+                x = offset_x + float(item["x"]) * self.original_image.width * self.image_scale
+                y = offset_y + float(item["y"]) * self.original_image.height * self.image_scale
+            except (KeyError, TypeError, ValueError):
+                continue
+            is_selected = active and index == self.selected_point_index
+            radius = 7 if is_selected else 5
+            outline = "#ffffff" if active else "#e5e7eb"
+            width = 2 if active else 1
+            self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=color, outline=outline, width=width)
+            label = str(item.get("label", "")) if self.show_pose_names else ""
+            self.draw_point_label(x, y, KEYPOINT_NUMBERS.get(str(item.get("label", "")), "?"), label)
+
+    def draw_point_label(self, x: float, y: float, number: int | str, label: str) -> None:
+        text = f"{number}. {label}" if label else str(number)
+        text_id = self.canvas.create_text(x + 10, y - 10, text=text, fill="#111827", anchor="w", font=("Arial", 11, "bold"))
+        bbox = self.canvas.bbox(text_id)
+        if bbox is None:
+            return
+        pad = 3
+        rect_id = self.canvas.create_rectangle(
+            bbox[0] - pad,
+            bbox[1] - pad,
+            bbox[2] + pad,
+            bbox[3] + pad,
+            fill="#ffffff",
+            outline="#d1d5db",
+        )
+        self.canvas.tag_raise(text_id, rect_id)
+
+    def toggle_pose_names(self) -> None:
+        self.show_pose_names = not self.show_pose_names
+        self.pose_name_button.config(text=f"Names: {'ON' if self.show_pose_names else 'OFF'}")
+        self.render_image()
+
+    def zoom_in(self) -> None:
+        self.zoom_factor = min(ZOOM_MAX, self.zoom_factor * ZOOM_STEP)
+        self.render_image()
+
+    def zoom_out(self) -> None:
+        self.zoom_factor = max(ZOOM_MIN, self.zoom_factor / ZOOM_STEP)
+        self.render_image()
 
     def canvas_to_normalized(self, event_x: int, event_y: int) -> tuple[float, float] | None:
         if self.original_image is None:
@@ -311,6 +444,9 @@ class DogPoseLabeler:
     def on_canvas_click(self, event: object) -> None:
         if self.current_image is None:
             return
+        if not self.is_valid_label_set():
+            self.set_status("Opposite labeling is only available for Left/Right side images.")
+            return
         hit_index = self.find_nearest_point(event.x, event.y)
         if hit_index >= 0:
             self.selected_point_index = hit_index
@@ -326,11 +462,7 @@ class DogPoseLabeler:
         if point is None:
             return
         x, y = point
-        self.annotations.append({
-            "x": str(x),
-            "y": str(y),
-            "label": self.selected_label.get(),
-        })
+        self.annotations.append({"x": str(x), "y": str(y), "label": self.selected_label.get()})
         self.selected_point_index = len(self.annotations) - 1
         self.dragging_point_index = self.selected_point_index
         self.update_point_list()
@@ -362,10 +494,11 @@ class DogPoseLabeler:
     def update_point_list(self, keep_selection: bool = False) -> None:
         previous_selection = self.selected_point_index
         self.point_list.delete(0, "end")
-        for index, item in enumerate(self.annotations):
+        for item in self.annotations:
             x = float(item["x"])
             y = float(item["y"])
-            self.point_list.insert("end", f"{index + 1}. {item['label']}  ({x:.4f}, {y:.4f})")
+            keypoint_number = KEYPOINT_NUMBERS.get(item["label"], "?")
+            self.point_list.insert("end", f"{keypoint_number}. {item['label']}  ({x:.4f}, {y:.4f})")
         if keep_selection and 0 <= previous_selection < len(self.annotations):
             self.point_list.selection_set(previous_selection)
             self.point_list.see(previous_selection)
@@ -373,38 +506,44 @@ class DogPoseLabeler:
     def save_label(self) -> None:
         if self.current_image is None or self.current_json is None or self.original_image is None:
             return
+        if not self.is_valid_label_set():
+            messagebox.showwarning("Cannot save", "Opposite labeling is only available for Left/Right side images.")
+            return
+
+        self.sync_active_annotations()
         label_path = self.label_path_for(self.current_image)
         output_image_path = self.output_image_path_for(self.current_image)
         label_path.parent.mkdir(parents=True, exist_ok=True)
         output_image_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.current_json["annotation_info"] = self.annotations
+        self.current_json.setdefault("annotation_info", [])
+        self.current_json.setdefault("opposite_annotation_info", [])
+        self.current_json["annotation_info"] = self.main_annotations
+        self.current_json["opposite_annotation_info"] = self.opposite_annotations
+        if self.label_set.get() == "Opposite":
+            self.current_json["opposite_direction"] = self.opposite_direction()
         self.current_json["image_info"]["filename"] = self.current_image.stem
         self.current_json["image_info"]["file_format"] = self.current_image.suffix.lstrip(".").lower()
         self.current_json["image_info"]["image_size"] = self.current_image.stat().st_size
         self.current_json["image_info"]["resolution"] = f"{self.original_image.width}X{self.original_image.height}"
 
         shutil.copy2(self.current_image, output_image_path)
-        label_path.write_text(
-            json.dumps(self.current_json, ensure_ascii=False, indent=4) + "\n",
-            encoding="utf-8",
-        )
-        self.set_status(f"Saved: {output_image_path} / {label_path}")
+        label_path.write_text(json.dumps(self.current_json, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
+        self.set_status(f"Saved {self.label_set.get()} to {self.annotation_key()}: {label_path}")
 
     def undo_point(self) -> None:
-        if not self.annotations:
-            return
-        self.annotations.pop()
-        self.selected_point_index = -1
-        self.update_point_list()
-        self.render_image()
+        if self.annotations:
+            self.annotations.pop()
+            self.selected_point_index = -1
+            self.update_point_list()
+            self.render_image()
 
     def clear_points(self) -> None:
         if not self.annotations:
             return
-        if not messagebox.askyesno("Clear annotations", "현재 이미지의 모든 키포인트를 삭제할까요?"):
+        if not messagebox.askyesno("Clear annotations", "현재 선택한 라벨 세트의 모든 키포인트를 삭제할까요?"):
             return
-        self.annotations = []
+        self.annotations.clear()
         self.selected_point_index = -1
         self.update_point_list()
         self.render_image()
