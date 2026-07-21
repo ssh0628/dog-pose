@@ -5,7 +5,7 @@ import json
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import BOTH, LEFT, RIGHT, Y, Canvas, Frame, Label, Listbox, Scrollbar, StringVar, Tk, ttk
+from tkinter import BOTH, LEFT, RIGHT, Y, Button, Canvas, Frame, Label, Listbox, Scrollbar, StringVar, Tk, ttk
 
 try:
     from PIL import Image, ImageTk
@@ -13,13 +13,16 @@ except ImportError as exc:
     raise SystemExit("Pillow is required. Install it with: uv add pillow") from exc
 
 
-DATA_ROOT = "labeled_data_debug"
+DATA_ROOT = "/Users/sonseunghyeon/Desktop/project/dog-pose/dataset/labeled_data/TrainingLabeled"
 DIRECTIONS = ("Front", "Back", "Left", "Right")
 OPPOSITE_DIRECTIONS = {"Left": "Right", "Right": "Left"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DISPLAY_SCALE_LIMIT = 0.8
 MAIN_COLOR = "#2563eb"
 OPPOSITE_COLOR = "#f97316"
+ZOOM_MIN = 0.25
+ZOOM_MAX = 4.0
+ZOOM_STEP = 1.25
 
 KEYPOINT_LABELS = [
     "Ear",
@@ -189,6 +192,7 @@ class LabelCheckerApp:
         self.tk_image: ImageTk.PhotoImage | None = None
         self.image_offset = (0, 0)
         self.image_scale = 1.0
+        self.zoom_factor = 1.0
 
         self.root.title("Dog Pose Label Checker")
         self.root.geometry("1180x760")
@@ -226,9 +230,16 @@ class LabelCheckerApp:
         self.canvas = Canvas(center, background="#20242a", highlightthickness=0)
         self.canvas.pack(fill=BOTH, expand=True)
         self.canvas.bind("<Configure>", lambda _: self.render_image())
+        zoom_controls = Frame(self.canvas, background="#111827")
+        Button(zoom_controls, text="-", width=3, command=self.zoom_out).pack(side=LEFT)
+        Button(zoom_controls, text="+", width=3, command=self.zoom_in).pack(side=LEFT)
+        zoom_controls.place(relx=1.0, x=-12, y=12, anchor="ne")
 
         right_panel = Frame(self.root, width=360, padx=8, pady=8)
         right_panel.pack(side=RIGHT, fill=Y)
+        Label(right_panel, text="Annotations", anchor="w").pack(fill="x")
+        self.annotation_list = Listbox(right_panel, exportselection=False, height=18)
+        self.annotation_list.pack(fill="x", pady=(0, 8))
         Label(right_panel, text="Problems", anchor="w").pack(fill="x")
         self.problem_list = Listbox(right_panel, exportselection=False)
         self.problem_list.pack(fill=BOTH, expand=True)
@@ -254,6 +265,7 @@ class LabelCheckerApp:
         else:
             self.current_record = None
             self.original_image = None
+            self.annotation_list.delete(0, "end")
             self.problem_list.delete(0, "end")
             self.status.config(text="No records")
             self.render_image()
@@ -265,6 +277,8 @@ class LabelCheckerApp:
 
     def load_record(self, record: LabelRecord) -> None:
         self.current_record = record
+        self.annotation_list.delete(0, "end")
+        self.populate_annotation_list(record)
         self.problem_list.delete(0, "end")
         for message in record.errors:
             self.problem_list.insert("end", f"ERROR: {message}")
@@ -278,6 +292,23 @@ class LabelCheckerApp:
         )
         self.render_image()
 
+    def populate_annotation_list(self, record: LabelRecord) -> None:
+        for item in record.annotations:
+            self.insert_annotation_item("Main", item)
+        for item in record.opposite_annotations:
+            self.insert_annotation_item("Opp", item)
+
+    def insert_annotation_item(self, group: str, item: dict) -> None:
+        label = str(item.get("label", ""))
+        keypoint_number = KEYPOINT_NUMBERS.get(label, "?")
+        try:
+            x = float(item.get("x"))
+            y = float(item.get("y"))
+            coordinates = f"({x:.4f}, {y:.4f})"
+        except (TypeError, ValueError):
+            coordinates = "(invalid)"
+        self.annotation_list.insert("end", f"{group} {keypoint_number}. {label} {coordinates}")
+
     def render_image(self) -> None:
         self.canvas.delete("all")
         if self.original_image is None:
@@ -286,11 +317,12 @@ class LabelCheckerApp:
 
         canvas_width = max(1, self.canvas.winfo_width())
         canvas_height = max(1, self.canvas.winfo_height())
-        scale = min(
+        base_scale = min(
             (canvas_width * DISPLAY_SCALE_LIMIT) / self.original_image.width,
             (canvas_height * DISPLAY_SCALE_LIMIT) / self.original_image.height,
             1.0,
         )
+        scale = base_scale * self.zoom_factor
         display_width = max(1, int(self.original_image.width * scale))
         display_height = max(1, int(self.original_image.height * scale))
         self.image_scale = scale
@@ -304,10 +336,10 @@ class LabelCheckerApp:
         if self.current_record is None or self.original_image is None:
             return
         offset_x, offset_y = self.image_offset
-        self.draw_annotation_set(self.current_record.annotations, offset_x, offset_y, MAIN_COLOR, "")
-        self.draw_annotation_set(self.current_record.opposite_annotations, offset_x, offset_y, OPPOSITE_COLOR, "O")
+        self.draw_annotation_set(self.current_record.annotations, offset_x, offset_y, MAIN_COLOR)
+        self.draw_annotation_set(self.current_record.opposite_annotations, offset_x, offset_y, OPPOSITE_COLOR)
 
-    def draw_annotation_set(self, annotations: list[dict], offset_x: int, offset_y: int, color: str, prefix: str) -> None:
+    def draw_annotation_set(self, annotations: list[dict], offset_x: int, offset_y: int, color: str) -> None:
         for item in annotations:
             try:
                 x = offset_x + float(item["x"]) * self.original_image.width * self.image_scale
@@ -317,8 +349,7 @@ class LabelCheckerApp:
             self.canvas.create_oval(x - 6, y - 6, x + 6, y + 6, fill=color, outline="#ffffff", width=2)
             label = str(item.get("label", "")) if self.show_pose_names else ""
             keypoint_number = KEYPOINT_NUMBERS.get(str(item.get("label", "")), "?")
-            display_number = f"{prefix}{keypoint_number}" if prefix else keypoint_number
-            self.draw_annotation_label(x, y, display_number, label)
+            self.draw_annotation_label(x, y, keypoint_number, label)
 
     def draw_annotation_label(self, x: float, y: float, number: int | str, label: str) -> None:
         text = f"{number}. {label}" if label else str(number)
@@ -333,6 +364,14 @@ class LabelCheckerApp:
     def toggle_pose_names(self) -> None:
         self.show_pose_names = not self.show_pose_names
         self.pose_name_button.config(text=f"Names: {'ON' if self.show_pose_names else 'OFF'}")
+        self.render_image()
+
+    def zoom_in(self) -> None:
+        self.zoom_factor = min(ZOOM_MAX, self.zoom_factor * ZOOM_STEP)
+        self.render_image()
+
+    def zoom_out(self) -> None:
+        self.zoom_factor = max(ZOOM_MIN, self.zoom_factor / ZOOM_STEP)
         self.render_image()
 
 

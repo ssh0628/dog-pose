@@ -13,8 +13,8 @@ except ImportError as exc:
     raise SystemExit("Pillow is required. Install it with: uv add pillow") from exc
 
 
-INPUT_ROOT = "samples"
-OUTPUT_ROOT = "labeled_data"
+INPUT_ROOT = "labeled_data/TrainingLabeled"
+OUTPUT_ROOT = "labeled_data_debug"
 
 DIRECTIONS = ("Front", "Back", "Left", "Right")
 LABEL_SETS = ("Main", "Opposite")
@@ -520,8 +520,10 @@ class DogPoseLabeler:
         self.current_json.setdefault("opposite_annotation_info", [])
         self.current_json["annotation_info"] = self.main_annotations
         self.current_json["opposite_annotation_info"] = self.opposite_annotations
-        if self.label_set.get() == "Opposite":
+        if self.opposite_annotations:
             self.current_json["opposite_direction"] = self.opposite_direction()
+        else:
+            self.current_json["opposite_direction"] = ""
         self.current_json["image_info"]["filename"] = self.current_image.stem
         self.current_json["image_info"]["file_format"] = self.current_image.suffix.lstrip(".").lower()
         self.current_json["image_info"]["image_size"] = self.current_image.stat().st_size
