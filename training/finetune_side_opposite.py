@@ -10,12 +10,26 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "side" / "best.pt"
-DEFAULT_DATA = (
-    PROJECT_ROOT
-    / "dataset"
-    / "side_opposite_pilot"
-    / "dog_pose_side_opposite_22kpt.yaml"
-)
+DATASET_PRESETS = {
+    "combined": {
+        "data": PROJECT_ROOT
+        / "dataset"
+        / "side_opposite_pilot"
+        / "dog_pose_side_opposite_22kpt.yaml",
+        "train": 400,
+        "val": 80,
+        "name": "side_opposite_pilot_finetune",
+    },
+    "opposite-only": {
+        "data": PROJECT_ROOT
+        / "dataset"
+        / "side_opposite_only"
+        / "dog_pose_side_opposite_22kpt.yaml",
+        "train": 100,
+        "val": 20,
+        "name": "side_opposite_only_finetune",
+    },
+}
 DEFAULT_PROJECT = PROJECT_ROOT / "runs"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -33,7 +47,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MODEL,
         help=f"Existing side-model best.pt (default: {DEFAULT_MODEL}).",
     )
-    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    parser.add_argument(
+        "--dataset",
+        choices=tuple(DATASET_PRESETS),
+        default="combined",
+        help="Dataset preset to use (default: combined).",
+    )
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=None,
+        help="Override the YAML path selected by --dataset.",
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -45,7 +70,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--project", type=Path, default=DEFAULT_PROJECT)
-    parser.add_argument("--name", default="side_opposite_pilot_finetune")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Run name. Defaults to a name derived from --dataset.",
+    )
     parser.add_argument("--optimizer", default="AdamW")
     parser.add_argument(
         "--lr0",
@@ -143,7 +172,8 @@ def validate_split(split_name: str, image_dir: Path) -> int:
 
 def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
     model_path = args.model.expanduser().resolve()
-    data_path = args.data.expanduser().resolve()
+    preset = DATASET_PRESETS[args.dataset]
+    data_path = (args.data or preset["data"]).expanduser().resolve()
 
     if not model_path.is_file():
         raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
@@ -155,10 +185,13 @@ def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
     dataset_root, train_dir, val_dir = resolve_dataset_paths(data_path)
     train_count = validate_split("train", train_dir)
     val_count = validate_split("val", val_dir)
-    if (train_count, val_count) != (400, 80):
+    expected_train = preset["train"]
+    expected_val = preset["val"]
+    if (train_count, val_count) != (expected_train, expected_val):
         raise ValueError(
-            "Pilot dataset count mismatch: "
-            f"expected train=400 and val=80, got train={train_count} and val={val_count}"
+            f"{args.dataset} dataset count mismatch: "
+            f"expected train={expected_train} and val={expected_val}, "
+            f"got train={train_count} and val={val_count}"
         )
 
     print(f"Dataset: {dataset_root}")
@@ -202,6 +235,8 @@ def common_ultralytics_args(args: argparse.Namespace, data_path: Path) -> dict:
 
 def main() -> int:
     args = parse_args()
+    if args.name is None:
+        args.name = DATASET_PRESETS[args.dataset]["name"]
     try:
         model_path, data_path = validate_inputs(args)
         if args.check_only:

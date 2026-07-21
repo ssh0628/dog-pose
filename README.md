@@ -154,6 +154,15 @@ python training/finetune_side_opposite.py --device 0
 기본 체크포인트 경로는 `models/side/best.pt`입니다. 다른 위치의 체크포인트를
 사용할 때만 `--model /path/to/best.pt`를 지정합니다.
 
+Opposite 라벨이 추가된 데이터 100/20장만으로 전이학습하려면 별도 데이터셋
+`dataset/side_opposite_only`을 선택합니다.
+
+```bash
+python training/finetune_side_opposite.py \
+  --dataset opposite-only \
+  --device 0
+```
+
 기본 실행 순서:
 - 기존 `best.pt`를 동일한 80장 validation set에서 먼저 평가
 - 400장 train set으로 100 epoch fine-tuning
