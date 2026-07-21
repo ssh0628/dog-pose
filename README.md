@@ -140,3 +140,28 @@ uv run python check_labels.py --data-root labeled_data --report-only
 ### sensor_values 
 - 뭔지 모르겠음
 - pose만 찍는다면 상관 없음
+
+## Side Opposite Pilot Fine-tuning
+
+`dataset/side_opposite_pilot`은 기존 side 300/60장과 opposite 100/20장을 합친
+YOLO Pose 파일럿 데이터셋입니다. 기존 side 모델의 `best.pt`를 초기 가중치로
+사용하되, `resume`이 아닌 별도의 새 학습으로 실행합니다.
+
+```bash
+python training/finetune_side_opposite.py --device 0
+```
+
+기본 체크포인트 경로는 `models/side/best.pt`입니다. 다른 위치의 체크포인트를
+사용할 때만 `--model /path/to/best.pt`를 지정합니다.
+
+기본 실행 순서:
+- 기존 `best.pt`를 동일한 80장 validation set에서 먼저 평가
+- 400장 train set으로 100 epoch fine-tuning
+- 결과를 `runs/side_opposite_pilot_finetune*`에 별도 저장
+
+데이터와 체크포인트 경로만 확인하고 학습하지 않으려면 `--check-only`를 사용합니다.
+
+```bash
+python training/finetune_side_opposite.py \
+  --check-only
+```
