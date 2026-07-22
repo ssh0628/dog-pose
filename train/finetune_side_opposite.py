@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fine-tune an existing 22-keypoint side-pose model on the pilot dataset."""
+"""Fine-tune an existing side-pose model on the opposite-only dataset."""
 
 from __future__ import annotations
 
@@ -10,35 +10,22 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "side" / "best.pt"
-DATASET_PRESETS = {
-    "combined": {
-        "data": PROJECT_ROOT
-        / "dataset"
-        / "side_opposite_pilot"
-        / "dog_pose_side_opposite_22kpt.yaml",
-        "train": 400,
-        "val": 80,
-        "name": "side_opposite_pilot_finetune",
-    },
-    "opposite-only": {
-        "data": PROJECT_ROOT
-        / "dataset"
-        / "side_opposite_only"
-        / "dog_pose_side_opposite_22kpt.yaml",
-        "train": 100,
-        "val": 20,
-        "name": "side_opposite_only_finetune",
-    },
-}
+DEFAULT_DATA = (
+    PROJECT_ROOT
+    / "dataset"
+    / "side_opposite_only"
+    / "dog_pose_side_opposite_22kpt.yaml"
+)
 DEFAULT_PROJECT = PROJECT_ROOT / "runs"
+DEFAULT_NAME = "side_opposite_only_finetune"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate an existing side best.pt on the pilot validation set, then "
-            "fine-tune it as a new Ultralytics YOLO Pose run."
+            "Fine-tune an existing side best.pt on the opposite-only dataset "
+            "as a new Ultralytics YOLO Pose run."
         )
     )
     parser.add_argument(
@@ -48,16 +35,10 @@ def parse_args() -> argparse.Namespace:
         help=f"Existing side-model best.pt (default: {DEFAULT_MODEL}).",
     )
     parser.add_argument(
-        "--dataset",
-        choices=tuple(DATASET_PRESETS),
-        default="combined",
-        help="Dataset preset to use (default: combined).",
-    )
-    parser.add_argument(
         "--data",
         type=Path,
-        default=None,
-        help="Override the YAML path selected by --dataset.",
+        default=DEFAULT_DATA,
+        help=f"Opposite-only dataset YAML (default: {DEFAULT_DATA}).",
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
@@ -72,8 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", type=Path, default=DEFAULT_PROJECT)
     parser.add_argument(
         "--name",
-        default=None,
-        help="Run name. Defaults to a name derived from --dataset.",
+        default=DEFAULT_NAME,
+        help=f"Run name (default: {DEFAULT_NAME}).",
     )
     parser.add_argument("--optimizer", default="AdamW")
     parser.add_argument(
@@ -84,12 +65,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache", action="store_true")
-    parser.add_argument(
-        "--baseline",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Evaluate the original checkpoint on the same validation set first.",
-    )
     parser.add_argument(
         "--amp",
         action=argparse.BooleanOptionalAction,
@@ -172,8 +147,7 @@ def validate_split(split_name: str, image_dir: Path) -> int:
 
 def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
     model_path = args.model.expanduser().resolve()
-    preset = DATASET_PRESETS[args.dataset]
-    data_path = (args.data or preset["data"]).expanduser().resolve()
+    data_path = args.data.expanduser().resolve()
 
     if not model_path.is_file():
         raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
@@ -185,14 +159,6 @@ def validate_inputs(args: argparse.Namespace) -> tuple[Path, Path]:
     dataset_root, train_dir, val_dir = resolve_dataset_paths(data_path)
     train_count = validate_split("train", train_dir)
     val_count = validate_split("val", val_dir)
-    expected_train = preset["train"]
-    expected_val = preset["val"]
-    if (train_count, val_count) != (expected_train, expected_val):
-        raise ValueError(
-            f"{args.dataset} dataset count mismatch: "
-            f"expected train={expected_train} and val={expected_val}, "
-            f"got train={train_count} and val={val_count}"
-        )
 
     print(f"Dataset: {dataset_root}")
     print(f"Pairs: train={train_count}, val={val_count}")
@@ -220,46 +186,25 @@ def load_pose_model(checkpoint: Path):
     return model
 
 
-def common_ultralytics_args(args: argparse.Namespace, data_path: Path) -> dict:
-    values = {
-        "data": str(data_path),
-        "imgsz": args.imgsz,
-        "batch": args.batch,
-        "workers": args.workers,
-        "project": str(args.project.expanduser().resolve()),
-    }
-    if args.device is not None:
-        values["device"] = args.device
-    return values
-
-
 def main() -> int:
     args = parse_args()
-    if args.name is None:
-        args.name = DATASET_PRESETS[args.dataset]["name"]
     try:
         model_path, data_path = validate_inputs(args)
         if args.check_only:
             print("Input validation passed. No training was started.")
             return 0
 
-        if args.baseline:
-            print("Evaluating the original checkpoint on the pilot validation set...")
-            baseline_model = load_pose_model(model_path)
-            baseline_model.val(
-                **common_ultralytics_args(args, data_path),
-                split="val",
-                name=f"{args.name}_baseline",
-                plots=True,
-                exist_ok=args.exist_ok,
-            )
-
         print("Starting a new fine-tuning run from the existing side checkpoint...")
         model = load_pose_model(model_path)
         model.train(
-            **common_ultralytics_args(args, data_path),
+            data=str(data_path),
             epochs=args.epochs,
             patience=args.patience,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            device=args.device,
+            workers=args.workers,
+            project=str(args.project.expanduser().resolve()),
             name=args.name,
             optimizer=args.optimizer,
             lr0=args.lr0,

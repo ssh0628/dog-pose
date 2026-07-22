@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import BOTH, LEFT, RIGHT, Y, Button, Canvas, Frame, Label, Listbox, Scrollbar, StringVar, Tk, ttk
@@ -161,6 +162,13 @@ def validate_record(record: LabelRecord) -> None:
 
 
 def validate_annotations(record: LabelRecord, annotations: list[dict], field_name: str) -> None:
+    label_counts = Counter(
+        item.get("label") for item in annotations if isinstance(item, dict)
+    )
+    for label, count in label_counts.items():
+        if label in KEYPOINT_LABEL_SET and count > 1:
+            record.errors.append(f"{field_name} contains {count} '{label}' points")
+
     for index, item in enumerate(annotations):
         prefix = f"{field_name}[{index}]"
         if not isinstance(item, dict):
@@ -188,8 +196,8 @@ class LabelCheckerApp:
         self.show_pose_names = False
         self.current_record: LabelRecord | None = None
         self.original_image: Image.Image | None = None
-        self.display_image: Image.Image | None = None
         self.tk_image: ImageTk.PhotoImage | None = None
+        self.rendered_size: tuple[int, int] | None = None
         self.image_offset = (0, 0)
         self.image_scale = 1.0
         self.zoom_factor = 1.0
@@ -286,6 +294,8 @@ class LabelCheckerApp:
             self.problem_list.insert("end", f"WARN: {message}")
 
         self.original_image = Image.open(record.image_path).convert("RGB") if record.image_path else None
+        self.tk_image = None
+        self.rendered_size = None
         self.status.config(
             text=f"{record.direction}/{record.stem} - {len(record.annotations)} main / "
             f"{len(record.opposite_annotations)} opposite"
@@ -327,8 +337,13 @@ class LabelCheckerApp:
         display_height = max(1, int(self.original_image.height * scale))
         self.image_scale = scale
         self.image_offset = ((canvas_width - display_width) // 2, (canvas_height - display_height) // 2)
-        self.display_image = self.original_image.resize((display_width, display_height), Image.Resampling.LANCZOS)
-        self.tk_image = ImageTk.PhotoImage(self.display_image)
+        display_size = (display_width, display_height)
+        if self.tk_image is None or self.rendered_size != display_size:
+            display_image = self.original_image.resize(
+                display_size, Image.Resampling.LANCZOS
+            )
+            self.tk_image = ImageTk.PhotoImage(display_image)
+            self.rendered_size = display_size
         self.canvas.create_image(*self.image_offset, anchor="nw", image=self.tk_image)
         self.draw_annotations()
 
@@ -415,6 +430,10 @@ def print_summary(summary: dict) -> None:
 def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root).expanduser().resolve()
+    if not data_root.is_dir():
+        raise SystemExit(f"Data root does not exist: {data_root}")
+    if not (data_root / "image").is_dir() or not (data_root / "label").is_dir():
+        raise SystemExit(f"Data root must contain image/ and label/: {data_root}")
     records = scan_records(data_root, args.direction)
     summary = summarize(records)
     print_summary(summary)

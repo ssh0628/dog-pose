@@ -53,13 +53,15 @@ labeled_data/
 저장된 라벨이 제대로 만들어졌는지 검사하고, 이미지 위에 점을 오버레이해서 확인합니다. main 라벨은 초록색, opposite 라벨은 주황색으로 표시됩니다.
 
 ```bash
-uv run python check_labels.py --data-root labeled_data
+uv run python data_preprocess/labeling_tool/check_labels.py --data-root labeled_data
 ```
 
 리포트만 보고 싶으면 GUI를 열지 않고 실행할 수 있습니다.
 
 ```bash
-uv run python check_labels.py --data-root labeled_data --report-only
+uv run python data_preprocess/labeling_tool/check_labels.py \
+  --data-root labeled_data \
+  --report-only
 ```
 
 검사 항목:
@@ -141,38 +143,24 @@ uv run python check_labels.py --data-root labeled_data --report-only
 - 뭔지 모르겠음
 - pose만 찍는다면 상관 없음
 
-## Side Opposite Pilot Fine-tuning
+## Side Opposite Fine-tuning
 
-`dataset/side_opposite_pilot`은 기존 side 300/60장과 opposite 100/20장을 합친
-YOLO Pose 파일럿 데이터셋입니다. 기존 side 모델의 `best.pt`를 초기 가중치로
-사용하되, `resume`이 아닌 별도의 새 학습으로 실행합니다.
+기존 Side `best.pt`를 초기 가중치로 사용해 `dataset/side_opposite_only`의
+train 100장, val 20장으로 새 파인튜닝을 실행합니다.
 
 ```bash
-python training/finetune_side_opposite.py --device 0
+python train/finetune_side_opposite.py --device 0
 ```
 
 기본 체크포인트 경로는 `models/side/best.pt`입니다. 다른 위치의 체크포인트를
 사용할 때만 `--model /path/to/best.pt`를 지정합니다.
 
-Opposite 라벨이 추가된 데이터 100/20장만으로 전이학습하려면 별도 데이터셋
-`dataset/side_opposite_only`을 선택합니다.
-
-```bash
-python training/finetune_side_opposite.py \
-  --dataset opposite-only \
-  --device 0
-```
-
-기본 실행 순서:
-- 기존 `best.pt`를 동일한 80장 validation set에서 먼저 평가
-- 400장 train set으로 100 epoch fine-tuning
-- 결과를 `runs/side_opposite_pilot_finetune*`에 별도 저장
+결과는 `runs/side_opposite_only_finetune`에 저장됩니다.
 
 데이터와 체크포인트 경로만 확인하고 학습하지 않으려면 `--check-only`를 사용합니다.
 
 ```bash
-python training/finetune_side_opposite.py \
-  --check-only
+python train/finetune_side_opposite.py --check-only
 ```
 
 ## Per-keypoint Pose Evaluation
@@ -181,11 +169,11 @@ python training/finetune_side_opposite.py \
 촬영 방향 기준 Original/Opposite 관절을 별도로 집계합니다.
 
 ```bash
-python training/evaluate_keypoints.py \
-  --model runs/side_opposite_only_finetune/weights/best.pt \
-  --dataset opposite-only
+python inference/evaluate_keypoints.py
 ```
 
-결과는 `runs/keypoint_evaluation/<model>_<dataset>_val` 아래의 CSV와 JSON으로
+결과는 `runs/keypoint_evaluation/<model>_val` 아래의 CSV와 JSON으로
 저장됩니다. 키포인트별 값은 단일 키포인트 OKS로 계산한 사용자 정의 AP이며,
 Ultralytics가 출력하는 전체 인스턴스 Pose mAP와는 구분해서 사용합니다.
+confidence 0.25 기준 출력률, OKS 0.5 기준 정답 출력률과 자신 있는 오류율도
+함께 기록합니다.

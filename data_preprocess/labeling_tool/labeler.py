@@ -49,7 +49,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dog pose desktop labeler")
     parser.add_argument("--input-root", default=INPUT_ROOT, help="Folder containing raw images to label")
     parser.add_argument("--output-root", default=OUTPUT_ROOT, help="Output root. Saves to image/{direction} and label/{direction}")
-    parser.add_argument("--image-root", dest="input_root", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -94,8 +93,8 @@ class DogPoseLabeler:
         self.opposite_annotations: list[dict[str, str]] = []
 
         self.original_image: Image.Image | None = None
-        self.display_image: Image.Image | None = None
         self.tk_image: ImageTk.PhotoImage | None = None
+        self.rendered_size: tuple[int, int] | None = None
         self.image_offset = (0, 0)
         self.image_scale = 1.0
         self.zoom_factor = 1.0
@@ -223,6 +222,8 @@ class DogPoseLabeler:
     def load_image(self, image_path: Path) -> None:
         self.current_image = image_path
         self.original_image = Image.open(image_path).convert("RGB")
+        self.tk_image = None
+        self.rendered_size = None
         self.selected_point_index = -1
         self.dragging_point_index = -1
 
@@ -357,8 +358,13 @@ class DogPoseLabeler:
         self.image_scale = scale
         self.image_offset = ((canvas_width - display_width) // 2, (canvas_height - display_height) // 2)
 
-        self.display_image = self.original_image.resize((display_width, display_height), Image.Resampling.LANCZOS)
-        self.tk_image = ImageTk.PhotoImage(self.display_image)
+        display_size = (display_width, display_height)
+        if self.tk_image is None or self.rendered_size != display_size:
+            display_image = self.original_image.resize(
+                display_size, Image.Resampling.LANCZOS
+            )
+            self.tk_image = ImageTk.PhotoImage(display_image)
+            self.rendered_size = display_size
         self.canvas.create_image(*self.image_offset, anchor="nw", image=self.tk_image)
         self.draw_points()
 
@@ -462,8 +468,24 @@ class DogPoseLabeler:
         if point is None:
             return
         x, y = point
-        self.annotations.append({"x": str(x), "y": str(y), "label": self.selected_label.get()})
-        self.selected_point_index = len(self.annotations) - 1
+        selected_label = self.selected_label.get()
+        existing_index = next(
+            (
+                index
+                for index, annotation in enumerate(self.annotations)
+                if annotation.get("label") == selected_label
+            ),
+            None,
+        )
+        if existing_index is None:
+            self.annotations.append(
+                {"x": str(x), "y": str(y), "label": selected_label}
+            )
+            self.selected_point_index = len(self.annotations) - 1
+        else:
+            self.annotations[existing_index]["x"] = str(x)
+            self.annotations[existing_index]["y"] = str(y)
+            self.selected_point_index = existing_index
         self.dragging_point_index = self.selected_point_index
         self.update_point_list()
         self.render_image()

@@ -14,17 +14,15 @@ from typing import Callable, Iterable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = PROJECT_ROOT / "models" / "side" / "best.pt"
-DATASET_PRESETS = {
-    "combined": PROJECT_ROOT
-    / "dataset"
-    / "side_opposite_pilot"
-    / "dog_pose_side_opposite_22kpt.yaml",
-    "opposite-only": PROJECT_ROOT
+DEFAULT_MODEL = (
+    PROJECT_ROOT / "runs" / "side_opposite_only_finetune" / "weights" / "best.pt"
+)
+DEFAULT_DATA = (
+    PROJECT_ROOT
     / "dataset"
     / "side_opposite_only"
-    / "dog_pose_side_opposite_22kpt.yaml",
-}
+    / "dog_pose_side_opposite_22kpt.yaml"
+)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 OKS_THRESHOLDS = tuple(value / 100 for value in range(50, 100, 5))
 
@@ -99,6 +97,12 @@ class ImageRecord:
 class MetricResult:
     gt_count: int
     prediction_count: int
+    output_count: int
+    output_rate: float | None
+    correct_output_count: int
+    correct_output_rate: float | None
+    confident_error_count: int
+    confident_error_rate: float | None
     ap50: float | None
     ap75: float | None
     map50_95: float | None
@@ -117,18 +121,25 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument(
-        "--dataset",
-        choices=tuple(DATASET_PRESETS),
-        default="opposite-only",
-    )
-    parser.add_argument("--data", type=Path, default=None)
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
     parser.add_argument("--split", choices=("train", "val"), default="val")
-    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--device", default=0)
     parser.add_argument("--conf", type=float, default=0.001)
     parser.add_argument("--iou", type=float, default=0.7)
+    parser.add_argument(
+        "--output-conf",
+        type=float,
+        default=0.25,
+        help="Box and keypoint confidence threshold used for output rate.",
+    )
+    parser.add_argument(
+        "--correct-oks",
+        type=float,
+        default=0.5,
+        help="Minimum OKS for a confident output to count as correct.",
+    )
     parser.add_argument(
         "--sigma",
         type=float,
@@ -254,17 +265,21 @@ def interpolated_ap(true_positives: list[int], false_positives: list[int], gt_co
             if recall >= recall_level
         ]
         average_precision += max(candidates, default=0.0) / 101
-    return average_precision, (recalls[-1] if recalls else 0.0)
+    return min(average_precision, 1.0), (recalls[-1] if recalls else 0.0)
 
 
 def evaluate_selection(
     records: Iterable[ImageRecord],
     selector: Selector,
     sigma: float,
+    output_confidence: float = 0.25,
+    correct_oks: float = 0.5,
     thresholds: tuple[float, ...] = OKS_THRESHOLDS,
 ) -> MetricResult:
     ground_truths: dict[tuple[str, int], list[tuple[int, Keypoint, float]]] = {}
     predictions: list[tuple[float, str, int, Keypoint]] = []
+    confident_predictions: list[tuple[float, str, int, Keypoint]] = []
+    output_counts: dict[tuple[str, int], int] = {}
 
     for record in records:
         selected_indices = selector(record.direction)
@@ -283,11 +298,64 @@ def evaluate_selection(
                 keypoint = prediction.keypoints[keypoint_index]
                 score = prediction.box_score * max(keypoint.visibility, 0.0)
                 predictions.append((score, record.image_id, keypoint_index, keypoint))
+                if (
+                    prediction.box_score >= output_confidence
+                    and keypoint.visibility >= output_confidence
+                ):
+                    output_counts[target_key] = output_counts.get(target_key, 0) + 1
+                    confident_predictions.append(
+                        (score, record.image_id, keypoint_index, keypoint)
+                    )
 
     gt_count = sum(len(targets) for targets in ground_truths.values())
+    output_count = sum(
+        min(len(targets), output_counts.get(target_key, 0))
+        for target_key, targets in ground_truths.items()
+    )
     predictions.sort(key=lambda item: (-item[0], item[1], item[2]))
+    confident_predictions.sort(key=lambda item: (-item[0], item[1], item[2]))
     if gt_count == 0:
-        return MetricResult(0, len(predictions), None, None, None, None, None)
+        return MetricResult(
+            gt_count=0,
+            prediction_count=len(predictions),
+            output_count=output_count,
+            output_rate=None,
+            correct_output_count=0,
+            correct_output_rate=None,
+            confident_error_count=0,
+            confident_error_rate=None,
+            ap50=None,
+            ap75=None,
+            map50_95=None,
+            recall50=None,
+            recall75=None,
+        )
+
+    confident_matches: set[tuple[str, int, int]] = set()
+    correct_output_count = 0
+    for _, image_id, keypoint_index, prediction in confident_predictions:
+        best_match = None
+        best_oks = -1.0
+        for ground_truth_index, target, area in ground_truths[
+            (image_id, keypoint_index)
+        ]:
+            match_key = (image_id, keypoint_index, ground_truth_index)
+            if match_key in confident_matches:
+                continue
+            oks = single_keypoint_oks(prediction, target, area, sigma)
+            if oks > best_oks:
+                best_oks = oks
+                best_match = match_key
+        if best_match is not None and best_oks >= correct_oks:
+            confident_matches.add(best_match)
+            correct_output_count += 1
+
+    confident_error_count = len(confident_predictions) - correct_output_count
+    confident_error_rate = (
+        confident_error_count / len(confident_predictions)
+        if confident_predictions
+        else None
+    )
 
     aps = []
     recalls = []
@@ -325,6 +393,12 @@ def evaluate_selection(
     return MetricResult(
         gt_count=gt_count,
         prediction_count=len(predictions),
+        output_count=output_count,
+        output_rate=output_count / gt_count,
+        correct_output_count=correct_output_count,
+        correct_output_rate=correct_output_count / gt_count,
+        confident_error_count=confident_error_count,
+        confident_error_rate=confident_error_rate,
         ap50=aps[threshold_to_index[0.5]],
         ap75=aps[threshold_to_index[0.75]],
         map50_95=sum(aps) / len(aps),
@@ -364,6 +438,12 @@ def metric_row(section: str, name: str, keypoint_id: str, result: MetricResult) 
         "name": name,
         "gt_count": result.gt_count,
         "prediction_count": result.prediction_count,
+        "output_count": result.output_count,
+        "output_rate": result.output_rate,
+        "correct_output_count": result.correct_output_count,
+        "correct_output_rate": result.correct_output_rate,
+        "confident_error_count": result.confident_error_count,
+        "confident_error_rate": result.confident_error_rate,
         "AP50": result.ap50,
         "AP75": result.ap75,
         "mAP50-95": result.map50_95,
@@ -372,22 +452,37 @@ def metric_row(section: str, name: str, keypoint_id: str, result: MetricResult) 
     }
 
 
-def calculate_metrics(records: tuple[ImageRecord, ...], sigma: float) -> list[dict]:
+def calculate_metrics(
+    records: tuple[ImageRecord, ...],
+    sigma: float,
+    output_confidence: float,
+    correct_oks: float,
+) -> list[dict]:
     rows = []
     for index, name in enumerate(KEYPOINT_NAMES):
-        result = evaluate_selection(records, fixed_selector(index), sigma)
+        result = evaluate_selection(
+            records, fixed_selector(index), sigma, output_confidence, correct_oks
+        )
         rows.append(metric_row("anatomical", name, str(index), result))
 
     for role in ("original", "opposite"):
-        result = evaluate_selection(records, role_selector(role), sigma)
+        result = evaluate_selection(
+            records, role_selector(role), sigma, output_confidence, correct_oks
+        )
         rows.append(metric_row("role_summary", f"{role}_all", "", result))
         for joint_name, left_index, right_index in SIDE_PAIRS:
             selector = role_joint_selector(role, left_index, right_index)
-            result = evaluate_selection(records, selector, sigma)
+            result = evaluate_selection(
+                records, selector, sigma, output_confidence, correct_oks
+            )
             rows.append(metric_row(f"{role}_joint", joint_name, "", result))
 
     shared_result = evaluate_selection(
-        records, lambda _direction: SHARED_KEYPOINTS, sigma
+        records,
+        lambda _direction: SHARED_KEYPOINTS,
+        sigma,
+        output_confidence,
+        correct_oks,
     )
     rows.append(metric_row("role_summary", "shared_all", "", shared_result))
     return rows
@@ -448,7 +543,7 @@ def output_directory(args: argparse.Namespace, model_path: Path) -> Path:
         PROJECT_ROOT
         / "runs"
         / "keypoint_evaluation"
-        / f"{model_name}_{args.dataset}_{args.split}"
+        / f"{model_name}_{args.split}"
     )
 
 
@@ -475,12 +570,14 @@ def save_results(
         "metric_definition": "custom single-keypoint OKS AP",
         "model": str(model_path),
         "data": str(data_path),
-        "dataset": args.dataset,
+        "dataset": data_path.parent.name,
         "split": args.split,
         "images": image_count,
         "sigma": args.sigma,
         "oks_thresholds": OKS_THRESHOLDS,
         "prediction_confidence": args.conf,
+        "output_confidence": args.output_conf,
+        "correct_output_oks": args.correct_oks,
         "rows": rows,
     }
     json_path = output_dir / "per_keypoint_metrics.json"
@@ -489,12 +586,22 @@ def save_results(
     )
 
     print("\nRole summary")
-    print(f"{'name':<16} {'GT':>5} {'AP50':>8} {'AP75':>8} {'mAP50-95':>10}")
+    output_label = f"Out@{args.output_conf:g}"
+    correct_label = f"Correct@{args.correct_oks:g}"
+    error_label = "ConfErr"
+    print(
+        f"{'name':<16} {'GT':>5} {output_label:>9} "
+        f"{correct_label:>11} {error_label:>8} "
+        f"{'AP50':>8} {'AP75':>8} {'mAP50-95':>10}"
+    )
     for row in rows:
         if row["section"] != "role_summary":
             continue
         print(
             f"{row['name']:<16} {row['gt_count']:>5} "
+            f"{rounded(row['output_rate']):>9} "
+            f"{rounded(row['correct_output_rate']):>11} "
+            f"{rounded(row['confident_error_rate']):>8} "
             f"{rounded(row['AP50']):>8} {rounded(row['AP75']):>8} "
             f"{rounded(row['mAP50-95']):>10}"
         )
@@ -522,18 +629,24 @@ def main() -> int:
     args = parse_args()
     try:
         model_path = args.model.expanduser().resolve()
-        data_path = (args.data or DATASET_PRESETS[args.dataset]).expanduser().resolve()
+        data_path = args.data.expanduser().resolve()
         if not model_path.is_file():
             raise FileNotFoundError(f"Model not found: {model_path}")
         if not data_path.is_file():
             raise FileNotFoundError(f"Dataset YAML not found: {data_path}")
         if args.sigma <= 0:
             raise ValueError("--sigma must be greater than zero")
+        if not 0 <= args.output_conf <= 1:
+            raise ValueError("--output-conf must be between zero and one")
+        if not 0 <= args.correct_oks <= 1:
+            raise ValueError("--correct-oks must be between zero and one")
 
         image_dir = resolve_image_dir(data_path, args.split)
         model = load_model(model_path)
         records = collect_records(model, image_dir, args)
-        rows = calculate_metrics(records, args.sigma)
+        rows = calculate_metrics(
+            records, args.sigma, args.output_conf, args.correct_oks
+        )
         save_results(
             rows,
             output_directory(args, model_path),
