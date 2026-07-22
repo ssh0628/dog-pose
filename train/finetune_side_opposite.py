@@ -42,8 +42,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--imgsz", type=int, default=960)
+    parser.add_argument("--batch", type=int, default=4)
     parser.add_argument(
         "--device",
         default=0,
@@ -60,9 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lr0",
         type=float,
-        default=0.001,
+        default=0.0001,
         help="Initial learning rate. The default is conservative for fine-tuning.",
     )
+    parser.add_argument("--freeze", type=int, default=10)
+    parser.add_argument("--translate", type=float, default=0.05)
+    parser.add_argument("--scale", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache", action="store_true")
     parser.add_argument(
@@ -208,6 +211,9 @@ def main() -> int:
             name=args.name,
             optimizer=args.optimizer,
             lr0=args.lr0,
+            freeze=args.freeze,
+            translate=args.translate,
+            scale=args.scale,
             seed=args.seed,
             deterministic=True,
             cache=args.cache,
