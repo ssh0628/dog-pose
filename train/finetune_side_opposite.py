@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Evaluate the original checkpoint on the same validation set first.",
     )
     parser.add_argument(

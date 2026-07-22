@@ -174,3 +174,18 @@ python training/finetune_side_opposite.py \
 python training/finetune_side_opposite.py \
   --check-only
 ```
+
+## Per-keypoint Pose Evaluation
+
+파인튜닝 모델의 22개 키포인트별 OKS `mAP50-95`, `AP50`, `AP75`를 계산하고,
+촬영 방향 기준 Original/Opposite 관절을 별도로 집계합니다.
+
+```bash
+python training/evaluate_keypoints.py \
+  --model runs/side_opposite_only_finetune/weights/best.pt \
+  --dataset opposite-only
+```
+
+결과는 `runs/keypoint_evaluation/<model>_<dataset>_val` 아래의 CSV와 JSON으로
+저장됩니다. 키포인트별 값은 단일 키포인트 OKS로 계산한 사용자 정의 AP이며,
+Ultralytics가 출력하는 전체 인스턴스 Pose mAP와는 구분해서 사용합니다.
